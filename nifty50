@@ -1,0 +1,130 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score
+import matplotlib.pyplot as plt
+
+# Fetch historical NIFTY 50 data
+TICKER = "^NSEI"
+START_DATE = "1990-01-01"
+data_fetch_result = yf.download(TICKER, start=START_DATE)
+
+# Handle cases where yfinance returns tuple
+if isinstance(data_fetch_result, tuple):
+    nifty50 = data_fetch_result[0].copy()
+else:
+    nifty50 = data_fetch_result.copy()
+
+# Flatten MultiIndex columns if present
+if isinstance(nifty50.columns, pd.MultiIndex):
+    nifty50.columns = ['_'.join([str(c) for c in col if c]) for col in nifty50.columns]
+else:
+    nifty50.columns = [str(c) for c in nifty50.columns]
+
+# Ensure datetime index
+if not isinstance(nifty50.index, pd.DatetimeIndex):
+    if "date" in [c.lower() for c in nifty50.columns]:
+        nifty50['Date'] = pd.to_datetime(nifty50['Date'])
+        nifty50.set_index('Date', inplace=True)
+    else:
+        nifty50.index = pd.to_datetime(nifty50.index)
+
+nifty50 = nifty50.loc[START_DATE:].copy()
+
+# Find Close column safely
+close_candidates = [c for c in nifty50.columns if "close" in c.lower()]
+if not close_candidates:
+    raise KeyError("No column containing 'close' found")
+close_col = close_candidates[0]
+
+nifty50[close_col] = pd.to_numeric(nifty50[close_col], errors='coerce')
+
+# Create tomorrow's price and classification target
+nifty50["Tomorrow"] = nifty50[close_col].shift(-1)
+nifty50["Target"] = (nifty50["Tomorrow"] > nifty50[close_col]).astype(int)
+nifty50 = nifty50.iloc[:-1].copy()
+
+# Random Forest Model
+model = RandomForestClassifier(n_estimators=200, min_samples_split=50, random_state=1)
+
+def predict(train, test, predictors, model):
+    train = train.dropna(subset=predictors + ["Target"])
+    test = test.copy()
+    model.fit(train[predictors], train["Target"])
+    probs = model.predict_proba(test[predictors])[:, 1]
+    preds = (probs >= 0.6).astype(int)  # Predict 'Up' only when confidence >= 60%
+    preds = pd.Series(preds, index=test.index, name="Predictions")
+    return pd.concat([test["Target"], preds], axis=1)
+
+def backtest(data, model, predictors, start=2500, step=250):
+    all_predictions = []
+    for i in range(start, data.shape[0], step):
+        train = data.iloc[0:i].copy()
+        test = data.iloc[i:(i+step)].copy()
+        if test.empty:
+            break
+        preds = predict(train, test, predictors, model)
+        all_predictions.append(preds)
+    if not all_predictions:
+        return pd.DataFrame(columns=["Target", "Predictions"])
+    return pd.concat(all_predictions)
+
+# Feature engineering
+horizons = [2, 5, 60, 250, 1000]
+new_predictors = []
+
+for horizon in horizons:
+    ratio_column = f"Close_Ratio_{horizon}"
+    rolling_avg = nifty50[close_col].rolling(horizon).mean()
+    nifty50[ratio_column] = nifty50[close_col] / rolling_avg
+
+    trend_column = f"Trend_{horizon}"
+    nifty50[trend_column] = nifty50["Target"].shift(1).rolling(horizon).sum()
+
+    new_predictors += [ratio_column, trend_column]
+
+nifty50 = nifty50.dropna(subset=new_predictors + ["Target"])
+
+# Run walk-forward backtest
+predictions = backtest(nifty50, model, new_predictors)
+
+if predictions.empty:
+    raise RuntimeError("No predictions were produced.")
+
+# Calculate model accuracy
+precision = precision_score(predictions["Target"], predictions["Predictions"])
+
+# Calculate returns
+idx = predictions.index
+actual_close = nifty50.loc[idx, close_col]
+actual_tomorrow = nifty50.loc[idx, "Tomorrow"]
+
+predictions["Actual_Returns"] = (actual_tomorrow - actual_close) / actual_close
+predictions["Model_Returns"] = predictions["Predictions"] * predictions["Actual_Returns"]
+
+# Cumulative return curves for comparison
+predictions["Cumulative_Market"] = (1 + predictions["Actual_Returns"]).cumprod()
+predictions["Cumulative_Model"] = (1 + predictions["Model_Returns"]).cumprod()
+
+# ---------------------------
+# 📈 Final Plot
+# Shows long-term performance:
+# 🔵 Market = Buy & Hold NIFTY 50
+# 🟠 Model = AI strategy only buys when prediction is confident
+# ---------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(predictions["Cumulative_Market"], label="Nifty 50 Buy & Hold", alpha=0.6)
+plt.plot(predictions["Cumulative_Model"], label="AI Model Strategy", linewidth=2)
+plt.title("Profitability: AI Model Strategy vs. Buy & Hold (Nifty 50)")
+plt.xlabel("Date")
+plt.ylabel("Growth of ₹1 Investment")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+print("Market Final Growth for ₹1 Investment:", predictions["Cumulative_Market"].iloc[-1])
+print("Model Final Growth for ₹1 Investment:", predictions["Cumulative_Model"].iloc[-1])
+print("Precision Score:", precision)
+
+
