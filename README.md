@@ -1,4 +1,3 @@
-# Stock-Market-Analysis-Using-Supervised-Machine-Learning
 This is my personal ML and Stock market analysis project
 
 # Stock Market Analysis and Prediction using Supervised Machine Learning
